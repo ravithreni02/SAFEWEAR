@@ -76,7 +76,7 @@ export interface LiveTrackingSessionData {
   id: string;
   wearerName: string;
   createdAt: number;
-  expiresAt: number | null;
+  expiresAt: number;
   active: boolean;
   heartRate: number;
   pendantWorn: boolean | null;

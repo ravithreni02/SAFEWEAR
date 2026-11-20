@@ -10,7 +10,7 @@ export interface TrackingSessionCreated {
   sessionId: string;
   trackingUrl: string;
   createdAt: number;
-  expiresAt: number | null;
+  expiresAt: number;
 }
 
 export interface SosDispatchResponse {
@@ -112,8 +112,6 @@ export function buildOfflineSmsUri(params: {
   heartRate: number;
   latitude: number | null;
   longitude: number | null;
-  trackingUrl?: string;
-  isOffline?: boolean;
   contacts: EmergencyContact[];
 }): { uri: string; body: string } | null {
   const phones = params.contacts
@@ -128,20 +126,9 @@ export function buildOfflineSmsUri(params: {
       : 'GPS unavailable';
 
   const hrText = params.heartRate > 0 ? `${params.heartRate} BPM` : 'Reading';
-  const header = params.isOffline
-    ? `EMERGENCY SOS from ${params.wearerName} (SafeWear - Offline SMS)`
-    : `EMERGENCY SOS from ${params.wearerName} (SafeWear)`;
+  const body = `EMERGENCY SOS from ${params.wearerName} (SafeWear - Offline SMS)\nHeart Rate: ${hrText}\nLocation: ${mapUrl}`;
 
-  const lines = [
-    header,
-    `Heart Rate: ${hrText}`,
-    `Location: ${mapUrl}`,
-    params.trackingUrl ? `Live Location Link: ${params.trackingUrl}` : '',
-  ].filter(Boolean);
-
-  const body = lines.join('\n');
-
-  // Use comma-separated recipients for standard mobile SMS composer
+  // Use comma-separated recipients for standard mobile SMS composer fallback
   const recipients = phones.join(',');
   const uri = `sms:${recipients}?body=${encodeURIComponent(body)}`;
   return { uri, body };
