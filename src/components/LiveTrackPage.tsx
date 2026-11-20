@@ -14,10 +14,14 @@ interface LiveTrackPageProps {
   sessionId: string;
 }
 
-function formatRemaining(ms: number): string {
+function formatElapsed(ms: number): string {
   const clamped = Math.max(0, Math.floor(ms / 1000));
-  const mins = Math.floor(clamped / 60);
+  const hrs = Math.floor(clamped / 3600);
+  const mins = Math.floor((clamped % 3600) / 60);
   const secs = clamped % 60;
+  if (hrs > 0) {
+    return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
@@ -123,8 +127,8 @@ export const LiveTrackPage: React.FC<LiveTrackPageProps> = ({ sessionId }) => {
     );
   }
 
-  const remainingMs = Math.max(0, session.expiresAt - nowMs);
-  const isLive = session.active && remainingMs > 0;
+  const elapsedMs = Math.max(0, nowMs - session.createdAt);
+  const isLive = session.active;
   const latestPoint =
     session.points.length > 0
       ? session.points[session.points.length - 1]
@@ -157,8 +161,8 @@ export const LiveTrackPage: React.FC<LiveTrackPageProps> = ({ sessionId }) => {
             />
             <span className={isLive ? 'text-red-300 font-semibold' : 'text-white/60'}>
               {isLive
-                ? `LIVE · ${formatRemaining(remainingMs)} left`
-                : 'TRACKING ENDED'}
+                ? `LIVE · ${formatElapsed(elapsedMs)}`
+                : 'SOS STOPPED'}
             </span>
           </div>
         </div>
@@ -186,8 +190,8 @@ export const LiveTrackPage: React.FC<LiveTrackPageProps> = ({ sessionId }) => {
                 </h1>
                 <p className="mt-1 text-sm text-white/70">
                   {isLive
-                    ? 'Location and heart rate update automatically in real time for 5 minutes.'
-                    : 'This 5-minute live tracking session has ended. Showing final recorded trail.'}
+                    ? 'Location and heart rate update continuously in real time until SOS is cancelled.'
+                    : 'This SOS session was stopped by the wearer. Showing full recorded trail.'}
                 </p>
               </div>
             </div>
@@ -236,10 +240,10 @@ export const LiveTrackPage: React.FC<LiveTrackPageProps> = ({ sessionId }) => {
           </div>
 
           <div className="rounded-[16px] border border-white/10 bg-[#17243A] p-4">
-            <p className="text-xs text-white/55">Time Remaining</p>
+            <p className="text-xs text-white/55">Active Duration</p>
             <p className="mt-1.5 flex items-center gap-1.5 font-mono text-xl font-bold text-white tabular-nums">
               <Clock className="h-4 w-4 text-[#5796F5]" />
-              {isLive ? formatRemaining(remainingMs) : '00:00'}
+              {isLive ? formatElapsed(elapsedMs) : 'Stopped'}
             </p>
           </div>
 

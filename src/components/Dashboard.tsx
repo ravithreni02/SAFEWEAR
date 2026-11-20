@@ -55,8 +55,7 @@ import { Snackbar } from './Snackbar';
 
 const CONTACTS_STORAGE_KEY = 'safewear_emergency_contacts_v1';
 const SOS_CANCEL_WINDOW_SECONDS = 6; // 5 to 7-second cancel window
-const LIVE_TRACK_DURATION_MS = 5 * 60 * 1000; // 5-minute live tracking link
-const LIVE_UPDATE_INTERVAL_MS = 5000; // Push live coordinates every 5s during 5-min window
+const LIVE_UPDATE_INTERVAL_MS = 5000; // Continuously push live coordinates every 5s while SOS is active
 const DEFAULT_HIGH_BPM = 120;
 const DEFAULT_LOW_BPM = 45;
 
@@ -116,29 +115,44 @@ const SensorCard: React.FC<SensorCardProps> = ({
   </div>
 );
 
+const SMS_ONLY_MIGRATION_KEY = 'safewear_sms_only_v1';
+
 function loadStoredContacts(): EmergencyContact[] {
   try {
     const raw = localStorage.getItem(CONTACTS_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as Array<Partial<EmergencyContact>>;
     if (!Array.isArray(parsed)) return [];
-    return parsed
+    const needsMigration = !localStorage.getItem(SMS_ONLY_MIGRATION_KEY);
+    const mapped: EmergencyContact[] = parsed
       .filter((c) => c.id && c.name && c.phone)
       .map((c) => ({
         id: String(c.id),
         name: String(c.name),
         phone: String(c.phone),
-        channel: c.channel || 'both',
+        channel:
+          needsMigration && (!c.channel || c.channel === 'both')
+            ? 'sms'
+            : c.channel || 'sms',
       }));
+    if (needsMigration) {
+      localStorage.setItem(SMS_ONLY_MIGRATION_KEY, '1');
+      localStorage.setItem(CONTACTS_STORAGE_KEY, JSON.stringify(mapped));
+    }
+    return mapped;
   } catch {
     return [];
   }
 }
 
-function formatCountdownMs(ms: number): string {
+function formatElapsedMs(ms: number): string {
   const clamped = Math.max(0, Math.floor(ms / 1000));
-  const mins = Math.floor(clamped / 60);
+  const hrs = Math.floor(clamped / 3600);
+  const mins = Math.floor((clamped % 3600) / 60);
   const secs = clamped % 60;
+  if (hrs > 0) {
+    return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  }
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
@@ -175,7 +189,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
   const [isConnected, setIsConnected] = useState(false);
   const [deviceName, setDeviceName] = useState('Not connected');
 
-  // SOS & 5-Minute Live Tracking state
+  // SOS & Continuous Live Tracking state
   const [sosActive, setSosActive] = useState(false);
   const [sosConfirmed, setSosConfirmed] = useState(false);
   const [countdown, setCountdown] = useState(SOS_CANCEL_WINDOW_SECONDS);
@@ -183,10 +197,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
   const [activeTrackingUrl, setActiveTrackingUrl] = useState<string | null>(
     null
   );
-  const [trackingExpiresAt, setTrackingExpiresAt] = useState<number | null>(
+  const [trackingStartedAt, setTrackingStartedAt] = useState<number | null>(
     null
   );
-  const [trackingRemainingMs, setTrackingRemainingMs] = useState(0);
+  const [trackingElapsedMs, setTrackingElapsedMs] = useState(0);
   const [deliveryResults, setDeliveryResults] = useState<
     DispatchDeliveryResult[]
   >([]);
@@ -220,7 +234,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
     useState<EmergencyContact[]>(loadStoredContacts);
   const [contactName, setContactName] = useState('');
   const [contactPhone, setContactPhone] = useState('');
-  const [contactChannel, setContactChannel] = useState<AlertChannel>('both');
+  const [contactChannel, setContactChannel] = useState<AlertChannel>('sms');
+  const [pendingSmsUri, setPendingSmsUri] = useState<string | null>(null);
   const [eventHistory, setEventHistory] =
     useState<SosEventRecord[]>(loadEventHistory);
 
@@ -292,26 +307,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
     };
   }, []);
 
-  // Update 5-minute live tracking countdown timer
+  // Update continuous live tracking elapsed timer (never expires until SOS is cancelled)
   useEffect(() => {
-    if (!trackingExpiresAt || !sosConfirmed) {
-      setTrackingRemainingMs(0);
+    if (!trackingStartedAt || !sosConfirmed) {
+      setTrackingElapsedMs(0);
       return;
     }
 
     const updateTick = () => {
-      const left = Math.max(0, trackingExpiresAt - Date.now());
-      setTrackingRemainingMs(left);
-      if (left === 0 && liveTrackTimerRef.current !== null) {
-        window.clearInterval(liveTrackTimerRef.current);
-        liveTrackTimerRef.current = null;
-      }
+      setTrackingElapsedMs(Math.max(0, Date.now() - trackingStartedAt));
     };
 
     updateTick();
     const id = window.setInterval(updateTick, 1000);
     return () => window.clearInterval(id);
-  }, [trackingExpiresAt, sosConfirmed]);
+  }, [trackingStartedAt, sosConfirmed]);
 
   const showMessage = useCallback((message: string) => {
     setSnackbarMessage(message);
@@ -430,9 +440,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
         heartRate: heartRateRef.current,
         latitude: lat,
         longitude: lng,
+        isOffline: true,
         contacts: contactsRef.current,
       });
-      if (sms) window.location.href = sms.uri;
+      if (sms) {
+        setPendingSmsUri(sms.uri);
+        window.location.href = sms.uri;
+      }
       return;
     }
 
@@ -445,6 +459,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
         longitude: lng,
         accuracy: pt?.accuracy,
       });
+      setActiveTrackingUrl(created.trackingUrl);
+      setTrackingStartedAt(created.createdAt);
 
       const dispatch = await dispatchAutomaticSosAlerts({
         wearerName,
@@ -456,15 +472,29 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       });
 
       setDeliveryResults(dispatch.results);
+      sendBrowserNotification(
+        'SafeWear Location Shared',
+        'Live location link & heart rate prepared for your emergency contacts.'
+      );
       if (dispatch.dispatched) {
-        showMessage(`Location sent to ${dispatch.sentCount} channel(s)!`);
+        setPendingSmsUri(null);
+        showMessage(`Location alert sent to ${dispatch.sentCount} contact(s).`);
       } else {
-        const firstErr = dispatch.results.find((r) => r.error)?.error;
-        showMessage(
-          firstErr
-            ? `Twilio error: ${firstErr}`
-            : 'Location link created. Check Twilio setup or use backup SMS/WhatsApp.'
-        );
+        const sms = buildOfflineSmsUri({
+          wearerName,
+          heartRate: heartRateRef.current,
+          latitude: lat,
+          longitude: lng,
+          trackingUrl: created.trackingUrl,
+          isOffline: false,
+          contacts: contactsRef.current,
+        });
+        if (sms) {
+          setPendingSmsUri(sms.uri);
+          setUsedOfflineFallback(true);
+          showMessage('Opening Phone SMS with your live location & heart rate.');
+          window.location.href = sms.uri;
+        }
       }
     } catch {
       const sms = buildOfflineSmsUri({
@@ -472,9 +502,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
         heartRate: heartRateRef.current,
         latitude: lat,
         longitude: lng,
+        isOffline: true,
         contacts: contactsRef.current,
       });
-      if (sms) window.location.href = sms.uri;
+      if (sms) {
+        setPendingSmsUri(sms.uri);
+        window.location.href = sms.uri;
+      }
     }
   }, [fetchPosition, showMessage, wearerName]);
 
@@ -487,7 +521,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       void stopLiveTrackingSession(activeSessionIdRef.current);
       activeSessionIdRef.current = null;
     }
-    setTrackingExpiresAt(null);
+    setTrackingStartedAt(null);
   }, []);
 
   const confirmSOS = useCallback(async () => {
@@ -519,10 +553,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
         heartRate: currentHr,
         latitude: lat,
         longitude: lng,
+        isOffline: true,
         contacts: currentContacts,
       });
 
       if (fallback) {
+        setPendingSmsUri(fallback.uri);
         window.location.href = fallback.uri;
       }
 
@@ -543,10 +579,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       return;
     }
 
-    // ONLINE: 1) Create 5-minute Live Tracking Link
+    // ONLINE: 1) Create continuous Live Tracking Link (stays active until SOS is cancelled)
     let trackingUrl: string | undefined;
     let sessionId: string | null = null;
-    let expiresAt = Date.now() + LIVE_TRACK_DURATION_MS;
 
     try {
       const created = await createLiveTrackingSession({
@@ -559,17 +594,16 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       });
       trackingUrl = created.trackingUrl;
       sessionId = created.sessionId;
-      expiresAt = created.expiresAt;
       activeSessionIdRef.current = sessionId;
       setActiveTrackingUrl(trackingUrl);
-      setTrackingExpiresAt(expiresAt);
+      setTrackingStartedAt(created.createdAt);
 
-      // Stream live GPS + HR updates for 5 minutes
+      // Continuously stream live GPS + HR updates until SOS is cancelled
       if (liveTrackTimerRef.current !== null) {
         window.clearInterval(liveTrackTimerRef.current);
       }
       liveTrackTimerRef.current = window.setInterval(async () => {
-        if (!activeSessionIdRef.current || Date.now() >= expiresAt) {
+        if (!activeSessionIdRef.current || !sosConfirmedRef.current) {
           if (liveTrackTimerRef.current !== null) {
             window.clearInterval(liveTrackTimerRef.current);
             liveTrackTimerRef.current = null;
@@ -593,11 +627,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       // If backend unreachable, drop into offline SMS fallback below
     }
 
-    // ONLINE: 2) Automatically dispatch WhatsApp & SMS via Twilio (hands-free)
+    // ONLINE: 2) Dispatch emergency alerts to contacts
     if (currentContacts.length === 0) {
       const summary = trackingUrl
-        ? '5-minute live tracking link active. Add emergency contacts to auto-send WhatsApp/SMS.'
-        : 'SOS confirmed. Add emergency contacts to enable automatic alerts.';
+        ? 'Continuous live tracking link active until cancelled. Add emergency contacts to send alerts.'
+        : 'SOS confirmed. Add emergency contacts to send location alerts.';
       appendEventRecord({
         outcome: 'sent',
         heartRate: currentHr,
@@ -606,6 +640,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
         trackingUrl,
         deliverySummary: summary,
       });
+      sendBrowserNotification('SafeWear SOS Active', summary);
       showMessage(summary);
       return;
     }
@@ -622,12 +657,35 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
 
       setDeliveryResults(dispatch.results);
 
+      let smsFallbackUri: string | null = null;
+      if (!dispatch.dispatched) {
+        const smsFallback = buildOfflineSmsUri({
+          wearerName,
+          heartRate: currentHr,
+          latitude: lat,
+          longitude: lng,
+          trackingUrl,
+          isOffline: false,
+          contacts: currentContacts,
+        });
+        if (smsFallback) {
+          smsFallbackUri = smsFallback.uri;
+          setPendingSmsUri(smsFallback.uri);
+          setUsedOfflineFallback(true);
+          window.location.href = smsFallback.uri;
+        }
+      } else {
+        setPendingSmsUri(null);
+      }
+
       const summary = dispatch.dispatched
-        ? `Automatically sent ${dispatch.sentCount} Twilio alert(s) with 5-min live link to ${currentContacts.length} contact(s).`
-        : '5-min live link ready. Set Twilio server env vars (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_SMS_FROM / TWILIO_WHATSAPP_FROM) to auto-send.';
+        ? `Live location alert sent to ${currentContacts.length} contact(s) — tracking active until cancelled.`
+        : smsFallbackUri
+          ? `Live location active until cancelled — Phone SMS ready for ${currentContacts.length} contact(s).`
+          : 'Continuous live location tracking active until cancelled.';
 
       appendEventRecord({
-        outcome: 'sent',
+        outcome: dispatch.dispatched ? 'sent' : 'offline_sms',
         heartRate: currentHr,
         latitude: lat,
         longitude: lng,
@@ -637,10 +695,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       });
 
       sendBrowserNotification(
-        'SafeWear SOS Dispatched',
+        'SafeWear SOS Activated',
         dispatch.dispatched
-          ? `Sent live 5-min tracking link to ${currentContacts.length} contact(s).`
-          : 'Live 5-min tracking link created.'
+          ? `Live location sent to ${currentContacts.length} contact(s). Tracking continuously until cancelled.`
+          : 'Live location tracking active. Phone SMS prepared for your emergency contacts.'
       );
       showMessage(summary);
     } catch {
@@ -651,9 +709,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
         heartRate: currentHr,
         latitude: lat,
         longitude: lng,
+        trackingUrl,
+        isOffline: true,
         contacts: currentContacts,
       });
       if (fallback) {
+        setPendingSmsUri(fallback.uri);
         window.location.href = fallback.uri;
       }
       const summary =
@@ -693,6 +754,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       setActiveTrackingUrl(null);
       setDeliveryResults([]);
       setUsedOfflineFallback(false);
+      setPendingSmsUri(null);
       setCountdown(SOS_CANCEL_WINDOW_SECONDS);
 
       if (wasPending) {
@@ -712,7 +774,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       }
 
       playAlertTone('cancel');
-      showMessage(wasConfirmed ? 'SOS & 5-min live tracking stopped.' : 'SOS cancelled.');
+      showMessage(wasConfirmed ? 'SOS & continuous live tracking stopped.' : 'SOS cancelled.');
     },
     [appendEventRecord, showMessage, stopLiveTrackingLoop]
   );
@@ -960,6 +1022,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
     setContacts((prev) => prev.filter((c) => c.id !== id));
   };
 
+  const handleUpdateContactChannel = (id: string, channel: AlertChannel) => {
+    setContacts((prev) =>
+      prev.map((c) => (c.id === id ? { ...c, channel } : c))
+    );
+    showMessage(`Alert channel set to ${CHANNEL_LABEL[channel]}.`);
+  };
+
   const handleCopyTrackingLink = async () => {
     if (!activeTrackingUrl) return;
     try {
@@ -977,12 +1046,15 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
       heartRate: heartRateRef.current,
       latitude: lastCoords?.latitude ?? null,
       longitude: lastCoords?.longitude ?? null,
+      trackingUrl: activeTrackingUrl ?? undefined,
+      isOffline: !navigator.onLine,
       contacts,
     });
     if (!fallback) {
       showMessage('Add at least one emergency contact first.');
       return;
     }
+    setPendingSmsUri(fallback.uri);
     window.location.href = fallback.uri;
   };
 
@@ -1138,8 +1210,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                 Your Safety Dashboard
               </h1>
               <p className="mt-1 text-sm text-white/60">
-                Hands-free BLE wearable SOS with automatic Twilio WhatsApp/SMS
-                dispatch, 5-minute live tracking link, and offline SMS fallback.
+                BLE wearable SOS with continuous live location sharing until
+                cancelled, SMS alerts, and live heart rate monitoring.
               </p>
             </div>
 
@@ -1168,22 +1240,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                       </span>
                     </p>
                     <p className="text-xs text-white/55">
-                      Auto-dispatch:{' '}
+                      Alert delivery:{' '}
                       <span className="text-white/85">
                         {!isOnline
-                          ? 'Offline SMS Fallback active'
+                          ? 'Offline Phone SMS Ready'
                           : anyTwilioReady
-                            ? [
-                                serverConfig.twilioWhatsappConfigured
-                                  ? 'Twilio WhatsApp'
-                                  : null,
-                                serverConfig.twilioSmsConfigured
-                                  ? 'Twilio SMS'
-                                  : null,
-                              ]
-                                .filter(Boolean)
-                                .join(' + ')
-                            : 'Live Link Ready (Configure Twilio env vars for auto-SMS/WhatsApp)'}
+                            ? 'Continuous Live Link + SMS Alerts'
+                            : 'Continuous Live Link + Phone SMS'}
                       </span>
                     </p>
                   </div>
@@ -1214,9 +1277,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                 title="Emergency SOS"
                 icon={<AlertTriangle className="h-5 w-5" />}
                 rightSlot={
-                  sosConfirmed && trackingRemainingMs > 0 ? (
-                    <span className="font-mono text-xs font-semibold text-red-300 tabular-nums">
-                      Live {formatCountdownMs(trackingRemainingMs)}
+                  sosConfirmed ? (
+                    <span className="font-mono text-xs font-semibold text-[#69F0AE] tabular-nums">
+                      Live {formatElapsedMs(trackingElapsedMs)}
                     </span>
                   ) : null
                 }
@@ -1236,7 +1299,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
 
                   <p className="mt-2.5 text-base font-bold text-white">
                     {sosConfirmed
-                      ? 'SOS Sent — 5-Minute Live Link Active'
+                      ? 'SOS Active — Continuous Live Location On'
                       : sosActive
                         ? 'SOS Activated'
                         : 'System Ready'}
@@ -1262,16 +1325,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                   ) : sosConfirmed ? (
                     <div className="mt-3 w-full space-y-3 text-left">
                       <p className="text-center text-xs text-white/70">
-                        Triggered at {sosDispatchedAt}
-                        {usedOfflineFallback
-                          ? ' · Offline SMS fallback triggered'
-                          : ' · Auto-dispatched hands-free'}
+                        Triggered at {sosDispatchedAt} · Sharing location
+                        continuously until cancelled
                       </p>
 
                       {activeTrackingUrl && (
                         <div className="rounded-lg border border-white/10 bg-[#111D32] p-3">
                           <p className="text-xs font-medium text-white/60">
-                            5-Minute Live Tracking Link
+                            Continuous Live Location Link
                           </p>
                           <div className="mt-1.5 flex items-center justify-between gap-2">
                             <a
@@ -1313,8 +1374,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                         <div className="space-y-2">
                           {deliveryResults.map((res, idx) => {
                             const cleanDigits = res.phone.replace(/[^\d]/g, '');
+                            const mapLink =
+                              lastCoords !== null
+                                ? `https://maps.google.com/?q=${lastCoords.latitude.toFixed(5)},${lastCoords.longitude.toFixed(5)}`
+                                : locationText;
                             const backupText = encodeURIComponent(
-                              `EMERGENCY SOS from ${wearerName} (SafeWear)\nHeart Rate: ${heartRate > 0 ? `${heartRate} BPM` : 'Reading'}\nLive 5-min Tracking Link: ${activeTrackingUrl || locationText}`
+                              `EMERGENCY SOS from ${wearerName} (SafeWear)\nHeart Rate: ${heartRate > 0 ? `${heartRate} BPM` : 'Reading'}\nLocation: ${mapLink}${activeTrackingUrl ? `\nLive Location Link: ${activeTrackingUrl}` : ''}`
                             );
                             const backupHref =
                               res.channel === 'whatsapp'
@@ -1324,55 +1389,35 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                             return (
                               <div
                                 key={`${res.phone}-${res.channel}-${idx}`}
-                                className="rounded-lg border border-white/10 bg-[#111D32]/80 px-3 py-2 text-xs"
+                                className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/10 bg-[#111D32]/80 px-3 py-2 text-xs"
                               >
-                                <div className="flex items-center justify-between gap-2">
-                                  <span className="text-white/90 font-medium">
-                                    {res.contactName} ·{' '}
+                                <span className="text-white/90 font-medium">
+                                  {res.contactName} ·{' '}
+                                  {res.channel === 'whatsapp'
+                                    ? 'WhatsApp'
+                                    : 'SMS'}
+                                </span>
+                                {res.status === 'sent' ? (
+                                  <span className="text-[#69F0AE] font-semibold">
+                                    Sent
+                                  </span>
+                                ) : (
+                                  <a
+                                    href={backupHref}
+                                    target={
+                                      res.channel === 'whatsapp'
+                                        ? '_blank'
+                                        : undefined
+                                    }
+                                    rel="noreferrer"
+                                    className="inline-flex items-center gap-1.5 rounded bg-[#1C2A44] px-2.5 py-1 text-[11px] font-medium text-[#A8C7FA] hover:bg-[#243658]"
+                                  >
+                                    <MessageSquare className="h-3 w-3" />
+                                    Send{' '}
                                     {res.channel === 'whatsapp'
                                       ? 'WhatsApp'
                                       : 'SMS'}
-                                  </span>
-                                  <span
-                                    className={
-                                      res.status === 'sent'
-                                        ? 'text-[#69F0AE] font-semibold'
-                                        : res.status === 'unconfigured'
-                                          ? 'text-amber-300 font-medium'
-                                          : 'text-red-400 font-semibold'
-                                    }
-                                  >
-                                    {res.status === 'sent'
-                                      ? 'Sent'
-                                      : res.status === 'unconfigured'
-                                        ? 'Needs Twilio Env'
-                                        : 'Failed'}
-                                  </span>
-                                </div>
-                                {res.error && res.status !== 'sent' && (
-                                  <p className="mt-1 text-[11px] leading-relaxed text-red-300/90 break-words">
-                                    {res.error}
-                                  </p>
-                                )}
-                                {res.status !== 'sent' && (
-                                  <div className="mt-2">
-                                    <a
-                                      href={backupHref}
-                                      target={
-                                        res.channel === 'whatsapp'
-                                          ? '_blank'
-                                          : undefined
-                                      }
-                                      rel="noreferrer"
-                                      className="inline-flex items-center gap-1.5 rounded bg-[#1C2A44] px-2.5 py-1 text-[11px] font-medium text-[#A8C7FA] hover:bg-[#243658]"
-                                    >
-                                      <MessageSquare className="h-3 w-3" />
-                                      Send via Phone{' '}
-                                      {res.channel === 'whatsapp'
-                                        ? 'WhatsApp'
-                                        : 'SMS'}
-                                    </a>
-                                  </div>
+                                  </a>
                                 )}
                               </div>
                             );
@@ -1381,15 +1426,25 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                       )}
 
                       <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
-                        {usedOfflineFallback && (
-                          <button
-                            type="button"
-                            onClick={handleManualOfflineSms}
-                            className="inline-flex items-center gap-1.5 rounded-lg bg-amber-600 px-4 py-2 text-xs font-semibold text-white hover:bg-amber-500 cursor-pointer"
+                        {pendingSmsUri ? (
+                          <a
+                            href={pendingSmsUri}
+                            className="inline-flex items-center gap-1.5 rounded-lg bg-[#2E7D32] px-4 py-2 text-xs font-semibold text-white hover:bg-[#388E3C] cursor-pointer"
                           >
                             <MessageSquare className="h-3.5 w-3.5" />
-                            Retry Offline SMS
-                          </button>
+                            Send SMS Now
+                          </a>
+                        ) : (
+                          usedOfflineFallback && (
+                            <button
+                              type="button"
+                              onClick={handleManualOfflineSms}
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-[#2E7D32] px-4 py-2 text-xs font-semibold text-white hover:bg-[#388E3C] cursor-pointer"
+                            >
+                              <MessageSquare className="h-3.5 w-3.5" />
+                              Send SMS Now
+                            </button>
+                          )
                         )}
                         <button
                           type="button"
@@ -1403,8 +1458,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                   ) : (
                     <p className="pt-2 text-xs text-white/60">
                       Click button once to arm (6s cancel window). If not
-                      cancelled, alerts &amp; 5-minute live link send
-                      automatically.
+                      cancelled, live location sharing stays active until you
+                      stop SOS.
                     </p>
                   )}
                 </div>
@@ -1482,7 +1537,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                 subtitle={
                   locationTrail.length > 0
                     ? `${locationTrail.length} trail updates recorded`
-                    : 'Used for 5-min live link & offline SMS'
+                    : 'Continuous live link & SMS ready'
                 }
                 icon={<MapPin className="h-6 w-6 text-[#5796F5]" />}
               />
@@ -1521,9 +1576,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                     aria-label="Alert delivery channel"
                     className="sm:col-span-4 rounded-lg border border-white/20 bg-[#111D32] px-2.5 py-2 text-xs text-white outline-none focus:border-[#5796F5]"
                   >
-                    <option value="both">WhatsApp + SMS</option>
-                    <option value="whatsapp">WhatsApp only</option>
                     <option value="sms">SMS only</option>
+                    <option value="whatsapp">WhatsApp only</option>
+                    <option value="both">WhatsApp + SMS</option>
                   </select>
                   <button
                     type="submit"
@@ -1537,33 +1592,50 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                 {contacts.length === 0 ? (
                   <p className="mt-3 text-xs text-white/55">
                     Add close contacts with international country code (e.g.
-                    +91... or +1...). On SOS, SafeWear automatically sends your
-                    heart rate and 5-minute live tracking link via Twilio
-                    WhatsApp/SMS, or via offline SMS if there is no internet.
+                    +91... or +1...). When SOS is active, SafeWear shares your
+                    heart rate and continuous live location link until SOS is
+                    cancelled.
                   </p>
                 ) : (
                   <ul className="mt-3 divide-y divide-white/10">
                     {contacts.map((contact) => (
                       <li
                         key={contact.id}
-                        className="flex items-center justify-between py-2.5"
+                        className="flex flex-wrap items-center justify-between gap-2 py-2.5"
                       >
-                        <div>
-                          <p className="text-sm font-medium text-white">
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium text-white truncate">
                             {contact.name}
                           </p>
                           <p className="text-xs text-white/60 font-mono tabular-nums">
-                            {contact.phone} · {CHANNEL_LABEL[contact.channel]}
+                            {contact.phone}
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveContact(contact.id)}
-                          aria-label={`Remove ${contact.name}`}
-                          className="rounded-lg p-1.5 text-white/50 hover:bg-white/10 hover:text-red-400 cursor-pointer"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          <select
+                            value={contact.channel}
+                            onChange={(e) =>
+                              handleUpdateContactChannel(
+                                contact.id,
+                                e.target.value as AlertChannel
+                              )
+                            }
+                            aria-label={`Alert channel for ${contact.name}`}
+                            className="rounded-md border border-white/15 bg-[#111D32] px-2 py-1 text-xs text-white/85 outline-none focus:border-[#5796F5]"
+                          >
+                            <option value="sms">SMS only</option>
+                            <option value="whatsapp">WhatsApp only</option>
+                            <option value="both">WhatsApp + SMS</option>
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveContact(contact.id)}
+                            aria-label={`Remove ${contact.name}`}
+                            className="rounded-lg p-1.5 text-white/50 hover:bg-white/10 hover:text-red-400 cursor-pointer"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
                       </li>
                     ))}
                   </ul>
@@ -1600,6 +1672,15 @@ export const Dashboard: React.FC<DashboardProps> = ({ user }) => {
                         <MapPin className="h-3.5 w-3.5" />
                         Send Location
                       </button>
+                      {pendingSmsUri && (
+                        <a
+                          href={pendingSmsUri}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-[#2E7D32] px-3 py-2 text-xs font-semibold text-white hover:bg-[#388E3C] transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                        >
+                          <MessageSquare className="h-3.5 w-3.5" />
+                          Open SMS App
+                        </a>
+                      )}
                     </div>
                   </div>
 

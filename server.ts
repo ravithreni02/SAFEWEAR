@@ -16,7 +16,7 @@ interface TrackingSession {
   id: string;
   wearerName: string;
   createdAt: number;
-  expiresAt: number;
+  expiresAt: number | null;
   active: boolean;
   heartRate: number;
   pendantWorn: boolean | null;
@@ -38,7 +38,6 @@ interface DeliveryResult {
   error?: string;
 }
 
-const LIVE_DURATION_MS = 5 * 60 * 1000; // 5-minute live tracking window
 const sessions = new Map<string, TrackingSession>();
 const sseClients = new Map<string, Set<Response>>();
 
@@ -52,13 +51,7 @@ function broadcastSession(session: TrackingSession): void {
 }
 
 function getEffectiveSession(id: string): TrackingSession | null {
-  const session = sessions.get(id);
-  if (!session) return null;
-  if (session.active && Date.now() >= session.expiresAt) {
-    session.active = false;
-    broadcastSession(session);
-  }
-  return session;
+  return sessions.get(id) ?? null;
 }
 
 function normalizePhone(raw: string): string {
@@ -144,13 +137,11 @@ async function startServer(): Promise<void> {
       twilioSmsConfigured: Boolean(
         hasAuth && (process.env.TWILIO_SMS_FROM || '').trim()
       ),
-      twilioWhatsappConfigured: Boolean(
-        hasAuth && (process.env.TWILIO_WHATSAPP_FROM || '').trim()
-      ),
+      twilioWhatsappConfigured: hasAuth,
     });
   });
 
-  // Create a 5-minute live tracking session
+  // Create a continuous live tracking session (stays active until SOS is cancelled)
   app.post('/api/track/sessions', (req: Request, res: Response) => {
     const body = req.body as {
       wearerName?: string;
@@ -188,7 +179,7 @@ async function startServer(): Promise<void> {
           ? body.wearerName.trim()
           : 'SafeWear Wearer',
       createdAt: now,
-      expiresAt: now + LIVE_DURATION_MS,
+      expiresAt: null,
       active: true,
       heartRate: typeof body.heartRate === 'number' ? body.heartRate : 0,
       pendantWorn:
@@ -267,8 +258,8 @@ async function startServer(): Promise<void> {
         heartRate: session.heartRate,
         timestamp: new Date().toISOString(),
       });
-      if (session.points.length > 120) {
-        session.points = session.points.slice(-120);
+      if (session.points.length > 500) {
+        session.points = session.points.slice(-500);
       }
     }
 
@@ -378,7 +369,7 @@ async function startServer(): Promise<void> {
       `Heart Rate: ${hr}`,
       `Coordinates: ${coords}`,
       body.trackingUrl
-        ? `Live 5-min Tracking Link: ${body.trackingUrl}`
+        ? `Live Location Link (Active until SOS cancelled): ${body.trackingUrl}`
         : mapsFallback
           ? `Map: ${mapsFallback}`
           : '',
@@ -436,23 +427,31 @@ async function startServer(): Promise<void> {
             error: outcome.error,
           });
         } else {
-          if (!whatsappFrom) {
-            results.push({
-              contactName: contact.name,
-              phone: normalized,
-              channel: 'whatsapp',
-              status: 'unconfigured',
-              error: 'TWILIO_WHATSAPP_FROM not configured on server',
-            });
-            continue;
-          }
-          const outcome = await sendTwilioMessage({
+          const sandboxFrom = 'whatsapp:+14155238886';
+          const effectiveFrom = whatsappFrom || sandboxFrom;
+          let outcome = await sendTwilioMessage({
             accountSid,
             authToken,
-            from: whatsappFrom,
+            from: effectiveFrom,
             to: `whatsapp:${normalized}`,
             body: messageText,
           });
+          if (
+            !outcome.ok &&
+            effectiveFrom !== sandboxFrom &&
+            outcome.error &&
+            (outcome.error.includes('572002') ||
+              outcome.error.includes('63007') ||
+              outcome.error.includes('21606'))
+          ) {
+            outcome = await sendTwilioMessage({
+              accountSid,
+              authToken,
+              from: sandboxFrom,
+              to: `whatsapp:${normalized}`,
+              body: messageText,
+            });
+          }
           results.push({
             contactName: contact.name,
             phone: normalized,
@@ -486,7 +485,11 @@ async function startServer(): Promise<void> {
   } else {
     const distDir = path.resolve(__dirname, 'dist');
     app.use(express.static(distDir));
-    app.get('*', (_req: Request, res: Response) => {
+    app.use((req: Request, res: Response, next) => {
+      if (req.method !== 'GET' || req.path.startsWith('/api/')) {
+        next();
+        return;
+      }
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
