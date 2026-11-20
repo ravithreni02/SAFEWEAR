@@ -1,0 +1,7 @@
+{
+  "name": "SafeWear",
+  "description": "Smart Safety Wearable IoT dashboard for ESP32-C3 BLE connection, emergency SOS countdown, live sensor monitoring, and location tracking.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
